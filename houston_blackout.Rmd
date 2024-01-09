@@ -1,0 +1,324 @@
+---
+title: 'Houston Blackout Analysis'
+author: "Vanessa Salgado"
+date: "2022-11-21"
+output:
+    html_document:
+      print_df: paged
+      toc: yes
+      toc_depth: 4
+      toc_float: yes
+      code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Overview
+
+In February 2021, severe winter storms in the United States caused a major power outage in the state of Texas. The loss of power resulted in over 4.5 million homes and businesses left without power, and several deaths. This analysis uses remotely sensed night light data to assess the impact and distribution of these blackouts. Data from the U.S. Census Bureau will be added to investigate if socioeconomic factors affect the recovery of power within the community.
+
+In this analysis, I will be: 
+- estimating the number of homes in Houston that lost power as a result of the first two storms\
+- investigating if socioeconomic factors are predictors of communities recovery from a power outage
+
+
+## The Data
+
+### Night Light Data 
+
+The remotely-sensed night lights data, acquired from the [Visible Infrared Imaging Radiometer Suite (VIIRS)](https://en.wikipedia.org/wiki/Visible_Infrared_Imaging_Radiometer_Suite) onboard the Suomi satellite. I used the the VNP46A1 to detect differences in night lights before and after the storm to identify areas that lost electric power.
+
+### Road and Home Data
+
+To determine the number of homes that lost power, you link (spatially join) these areas with [OpenStreetMap](https://www.openstreetmap.org/#map=4/38.01/-95.84) data on buildings and roads.
+
+### Socioeconomic Data
+
+To investigate potential socioeconomic factors that influenced recovery, I linked my analysis with data from the US Census Bureau.
+
+## Data Reading & Preparation
+
+### Libraries Used
+
+```{r message=FALSE, warning=FALSE}
+library(sf)
+library(stars)
+library(terra)
+library(spData)
+library(spDataLarge)
+library(tidyverse)
+library(here)
+library(knitr)
+library(tmap)
+```
+
+
+#### Finding locations of blackouts
+
+Night light data from NASA is distributed as 10x10 degree tiles. In order to capture all of the Houston area, there are two tiles from each night of interest.
+
+```{r include=TRUE}
+# read in lights raster datasets that have different spatial coverage
+
+# tiles for  2021-02-07 
+lights_h08v05_2021_02_07 <- read_stars(here("data","VNP46A1", "VNP46A1.A2021038.h08v05.001.2021039064328.tif"))
+lights_h08v06_2021_02_07 <- read_stars(here("data","VNP46A1", "VNP46A1.A2021038.h08v06.001.2021039064329.tif"))
+
+# tiles for  2021-02-16
+lights_h08v05_2021_02_16 <- read_stars(here("data","VNP46A1", "VNP46A1.A2021047.h08v05.001.2021048091106.tif"))
+lights_h08v06_2021_02_16 <- read_stars(here("data","VNP46A1", "VNP46A1.A2021047.h08v06.001.2021048091105.tif"))
+
+# combined tiles for dates 2021-02-16
+combined_tiles_02_07 <- st_mosaic(lights_h08v05_2021_02_07, lights_h08v06_2021_02_07)
+
+# combined for dates 2021-02-16
+combined_tiles_02_16 <- st_mosaic(lights_h08v05_2021_02_16, lights_h08v06_2021_02_16)
+```
+
+**Plotting tiles of the 02_07 map of lights**
+
+```{r}
+# Plotting combined tiles for 02_07 to see the map of lights 
+plot(combined_tiles_02_07, main = "Houston Lights February 07")
+```
+
+```{r}
+# Plotting combined tiles for 02_016 to see the map of lights
+plot(combined_tiles_02_16, main = "Houston Lights February 16")
+```
+
+##### Create a blackout mask
+
+
+Finding the change in night light intesity caused by the storm, required me to assume that any location that experienced a ddrop of more than 200 nW cm^-2^sr^-1^ experienced a blackout. These will be the area of interest and all other locations will be dropped.
+
+```{r include=TRUE}
+# to find the difference should I do 7 - 16 or 16 - 7
+# Logic behind: the subtraction: switch this
+lights_change <- (combined_tiles_02_16 - combined_tiles_02_07)
+
+# assigning NA to location less than 200
+lights_change[lights_change < 200] = NA
+
+#plot the difference 
+plot(lights_change,
+     main = "Change in Houston Night Lights Intensity",axes = TRUE)
+```
+
+```{r}
+# cut 
+(lights_cut = cut(lights_change, breaks = c(-Inf, 200, Inf),
+                  labels = c("less than 200 nW cm^-2^sr^-1^", "more than 200 nW cm^-2^sr^-1^")))
+plot(lights_cut,
+     main = "Locations Experiencing Blackouts",
+     axes = TRUE,
+     xlab = "longitude",
+     ylab = "latitude")
+```
+
+##### Vectorize the mask 
+
+This is my attempt to vectorise the blackout mask to make it easier to work with an `sf` object
+
+```{r include=TRUE}
+# vector that determined locations with blackouts
+lights_sf <- st_as_sf(lights_cut) %>%
+  st_make_valid()
+
+st_crs(lights_cut)
+```
+
+##### Crop the vectorized map to our region of interest 
+
+Here I redefined the Houston metropolitan area with the following coordinates (-96.5, 29), (-96.5, 30.5), (-94.5, 30.5), (-94.5, 29)
+
+```{r include=TRUE}
+# Define Houston Area with:
+# matrix off the coordinates of the Houston metropolitan area
+# creates a bounding box
+houston_coords = matrix(c(-96.5, 29,-96.5, 30.5,-94.5, 30.5,-94.5, 29, -96.5, 29),ncol=2, byrow=TRUE)
+
+# Coordinates to Polygons: 
+# sf_polygon function needs a matrix with two columns, with points in rows, 
+# the first point and the last point being the same to complete the polygon
+houston_area =  st_polygon(list(houston_coords))
+
+# Coordinates Plot:
+# plot(houston_area, axes = TRUE)
+
+#Transform CRS of houston_area to match lights_sf
+# Get CRS of lights_sf
+# st_crs(lights_sf) # EPSG:3083
+# Check CRS of lights_sf
+paste0("CRS of lights vector is :", st_crs(lights_sf))
+
+# Convert houston polygon to sf
+houston_sf <- st_sfc(houston_area, crs = st_crs(lights_sf))
+
+# verify that the night lights CRS and houston area CRS match
+paste0("Do the CRS of night lights sf and Houston sf match? ",
+       st_crs(lights_sf) == st_crs(houston_sf))
+```
+
+**Crop (spatially subset) the blackout mask to our region of interest**
+
+**Re-project the cropped blackout dataset to EPSG:3083 (NAD83 / Texas Centric Albers Equal Area)**
+
+```{r}
+paste0("Bounding box of Houston sf object: ",st_bbox(houston_sf))
+# crop (spatially subset) the blackout dataset `lights_cropped`
+
+lights_cropped <- st_crop(lights_change, st_bbox(houston_sf)) 
+lights_cropped <- st_transform(lights_cropped, crs = "EPSG:3083") 
+
+plot(lights_cropped, axes = TRUE)
+```
+
+**exclude highways from blackout mask **
+
+The roads geopackage includes data on roads other than highways.
+
+```{r include=TRUE}
+# Load data: 
+query <- "SELECT * FROM gis_osm_roads_free_1 WHERE fclass='motorway'"
+highways <- st_read("data/gis_osm_roads_free_1.gpkg", query = query)
+
+# Reproject data to EPSG:3083
+highways <-st_transform(highways, crs = "EPSG:3083")
+
+# Check CRS =  EPSG:3083
+paste0("Check CRS of highways sf: ", st_crs(highways))
+```
+
+```{r}
+#"Dissolved" means that any duplicate (e.g. coincident) line segments or portions of line segments will be reduced to a single line segment in the output.
+
+# highways within 200m: 
+highways_200m <- st_buffer(highways, dist = 200)
+highways_200m <- st_union(highways_200m)
+```
+
+```{r}
+# TODO: find areas that experienced blackouts that are further than 200m from a highway
+paste0("Check Is the CRS of lights cropped and highways the same? ", st_crs(lights_cropped)==st_crs(highways_200m))
+
+lights_cropped <- st_as_sf(lights_cropped, crs = st_crs(highways_200m))
+outside_buffer <- st_difference(lights_cropped, highways_200m)
+
+#checking number that experienced blackout areas
+num_of_blackout_area <- nrow(outside_buffer)
+paste0("Number of areas that experienced blackouts: ", num_of_blackout_area)
+
+plot(outside_buffer, main = 'Areas That Experienced Blackouts Further than 200m from a Highway')
+```
+
+## Homes Impacted by Blackouts
+
+##### load buildings data
+
+```{r include=TRUE}
+# Load buildings dataset: 
+query_buildings <- "SELECT * FROM gis_osm_buildings_a_free_1 WHERE (type IS NULL AND name IS NULL) OR type in ('residential', 'apartments', 'house', 'static_caravan', 'detached')"
+buildings <- st_read("data/gis_osm_buildings_a_free_1.gpkg", query = query_buildings)
+
+# Reproject data to EPSG:38083
+buildings <-st_transform(buildings, crs = "EPSG:3083")
+paste0("Check CRS of buildings",crs(buildings))
+```
+
+##### Find homes within blackout areas
+
+```{r include=TRUE}
+# try using st_filter with st_intersects
+# in this case we need to define which topological relationship we want to use
+# in this case we'll try "intersects"
+blackout_homes <- buildings %>% 
+  st_filter(y = outside_buffer, .predicate = st_intersects)
+
+# check: to see the number of entries in blackout_homes 
+paste0("Check number of blackout_homes: ", nrow(blackout_homes))
+
+# another check to see the number of unique home IDs `osm_id`
+paste0("Check number of blackout unique ID homes: ", length(unique(blackout_homes$osm_id)))
+
+# Check : osm_id == number of unique houses? 
+paste0("Check number of blackout homes rows == numbe of unique home IDs? ",
+       nrow(blackout_homes) == length(unique(blackout_homes$osm_id)))
+
+```
+
+#### Investigate socioeconomic factors
+
+
+The final step is to assign socioeconomic data to the 157410 homes in the Houston area that have experienced blackouts.
+
+**Finding census tracts impacted by blackout:**
+
+```{r include=TRUE}
+# st_read() , you can read one layer at a time 
+gdb_path <- here("data", "ACS_2019_5YR_TRACT_48_TEXAS.gdb")
+layer_list <- st_layers(gdb_path)
+
+geometries_layer <- "ACS_2019_5YR_TRACT_48_TEXAS"
+income_layer <- "X19_INCOME"
+
+# Read the selected layer
+geometries_data <- st_read(dsn = gdb_path, layer = geometries_layer)
+income_data <- st_read(dsn = gdb_path, layer = income_layer)
+
+# reproject 
+geometries_data <- st_transform(geometries_data, crs = 3083)
+
+median_income <- select(income_data,"B19013e1")
+paste0("Length of median income: ", length(median_income))
+```
+
+##### determine which census tracts experienced blackouts
+
+
+```{r include=TRUE}
+#  join the income data to the census tract geometries\
+income_geo_join <- merge(geometries_data , income_data, by = "GEOID")
+
+# -   spatially join census tract data with buildings determined to be impacted by blackouts\
+census_filtered_homes <- st_join(x = geometries_data,
+                           y = blackout_homes,
+                           join = st_intersects,
+                           left = FALSE)
+# find which census tracts had blackouts\
+# length(unique(census_filtered_homes$NAMELSAD))
+
+paste0("There were ",
+       length(unique(census_filtered_homes$NAMELSAD)),
+       " census tracts that expereinced blackouts" )
+
+# this is the unique census tracts that had blackouts
+unique(census_filtered_homes$NAMELSAD)
+```
+
+##### compare incomes of impacted tracts to unimpacted tracts (10 points)
+
+**Mapping income of areas impacted and impacted by blackouts:**
+
+
+```{r}
+# create map using separate income df's
+tm_shape(impacted) +
+  tm_fill(fill = 'median_income', palette = c('#d0f2f7', '#20a6bc'), #fill by inc, impacted
+          title = "Median Income (Impacted)") +
+  tm_lines(alpha = 0.4) +
+  tm_shape(unimpacted) +
+  tm_fill(fill = 'median_income', palette = c('#d8efdd', '#5abd6f'), #fill by inc, unimpacted
+          title = "Median Income (Unimpacted)") +
+  tm_lines(alpha = 0.4) +
+  tm_compass(type = "arrow", position = c("right", "top"), size = 2) + #add compass
+  tm_scale_bar() # add scalebar
+
+```
+
+## Conclusion
+This study uses aerial images of night lights in Houston to asses blackouts caused by a winter storm in February 2021. The difference in radiance between a night before and during the storm was used to determine areas where blackouts occurred. In order to improve this estimate, areas within 200m of highways were removed to avoid designating more rural areas as having had blackouts. Finally, homes in blackout areas were combined with data on the corresponding census tract and median income. Based on the distribution, displayed above, there does not appear to be a clear relationship between median income and whether or not an area experienced a blackout. 
+  
+This study provides a meaningful preliminary exploration on the relationship socioeconomic factors and the 2021 winter storm blackouts, but more work could be done. Using changes in night lights from two nights does not tell us about potential disparities regarding emergency resource distribution, blackout length, or individual impacts. It is also possible that the radiance difference chosen does not appropriated capture all impacted areas.
